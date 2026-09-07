@@ -6,6 +6,8 @@
 #include <util/threading.h>
 #include <util/windows/window-helpers.h>
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include <dxgi.h>
 #include <util/sse-intrin.h>
 #include <util/util_uint64.h>
@@ -837,6 +839,91 @@ static inline int inject_library(HANDLE process, const wchar_t *dll)
 				  0x12897dd89168789a, "GbfkDaezbp~X", 0x76aff7238788f7db);
 }
 
+static bool ensure_all_application_packages_rx(const wchar_t *dll_path)
+{
+	PSECURITY_DESCRIPTOR security_descriptor = NULL;
+	PSID all_application_packages_sid = NULL;
+	PACL current_dacl = NULL;
+	PACL updated_dacl = NULL;
+	DWORD error;
+	bool success = false;
+
+	blog(LOG_INFO, "[game-capture] Checking graphics hook ACL: %ls", dll_path);
+
+	if (!ConvertStringSidToSidW(L"S-1-15-2-1", &all_application_packages_sid)) {
+		error = GetLastError();
+		blog(LOG_WARNING, "[game-capture] Failed to resolve ALL APPLICATION PACKAGES SID for '%ls': %lu",
+		     dll_path, error);
+		goto cleanup;
+	}
+
+	error = GetNamedSecurityInfoW(dll_path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+				      &current_dacl, NULL, &security_descriptor);
+	if (error != ERROR_SUCCESS) {
+		blog(LOG_WARNING, "[game-capture] Failed to read graphics hook ACL for '%ls': %lu", dll_path, error);
+		goto cleanup;
+	}
+
+	if (current_dacl) {
+		for (DWORD i = 0; i < current_dacl->AceCount; i++) {
+			ACCESS_ALLOWED_ACE *ace;
+			GENERIC_MAPPING file_mapping = {FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE,
+							FILE_ALL_ACCESS};
+			DWORD access_mask;
+
+			if (!GetAce(current_dacl, i, (void **)&ace))
+				continue;
+			if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE ||
+			    (ace->Header.AceFlags & INHERITED_ACE) != 0 ||
+			    !EqualSid(&ace->SidStart, all_application_packages_sid))
+				continue;
+
+			access_mask = ace->Mask;
+			MapGenericMask(&access_mask, &file_mapping);
+			if ((access_mask & (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)) ==
+			    (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)) {
+				blog(LOG_INFO, "[game-capture] Graphics hook ACL already contains ALL APPLICATION PACKAGES (RX): %ls",
+				     dll_path);
+				success = true;
+				goto cleanup;
+			}
+		}
+	}
+
+	EXPLICIT_ACCESSW access = {0};
+	access.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+	access.grfAccessMode = GRANT_ACCESS;
+	access.grfInheritance = NO_INHERITANCE;
+	access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+	access.Trustee.ptstrName = all_application_packages_sid;
+
+	error = SetEntriesInAclW(1, &access, current_dacl, &updated_dacl);
+	if (error != ERROR_SUCCESS) {
+		blog(LOG_WARNING, "[game-capture] Failed to build graphics hook ACL for '%ls': %lu", dll_path, error);
+		goto cleanup;
+	}
+
+	error = SetNamedSecurityInfoW((wchar_t *)dll_path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+				      updated_dacl, NULL);
+	if (error != ERROR_SUCCESS) {
+		blog(LOG_WARNING, "[game-capture] Failed to update graphics hook ACL for '%ls': %lu", dll_path, error);
+		goto cleanup;
+	}
+
+	blog(LOG_INFO, "[game-capture] Added ALL APPLICATION PACKAGES (RX) to graphics hook ACL: %ls", dll_path);
+	success = true;
+
+cleanup:
+	if (updated_dacl)
+		LocalFree(updated_dacl);
+	if (security_descriptor)
+		LocalFree(security_descriptor);
+	if (all_application_packages_sid)
+		LocalFree(all_application_packages_sid);
+	return success;
+}
+
 static inline bool hook_direct(struct game_capture *gc, const char *hook_path_rel)
 {
 	wchar_t hook_path_abs_w[MAX_PATH];
@@ -932,6 +1019,17 @@ static inline bool inject_hook(struct game_capture *gc)
 	}
 	if (!check_file_integrity(gc, hook_path, "graphics hook")) {
 		goto cleanup;
+	}
+
+	if (gc->process_is_64bit) {
+		wchar_t *hook_path_w = NULL;
+		os_utf8_to_wcs_ptr(hook_path, 0, &hook_path_w);
+		if (hook_path_w) {
+			ensure_all_application_packages_rx(hook_path_w);
+			bfree(hook_path_w);
+		} else {
+			warn("could not convert graphics hook path while preparing ACL: %lu", GetLastError());
+		}
 	}
 
 #ifdef _WIN64
